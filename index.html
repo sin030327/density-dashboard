@@ -64,6 +64,12 @@
   .file-warning{ font-size:11.5px; color:var(--clay); background:#f6ebe8; border:1px solid rgba(166,61,47,.25); padding:14px; border-radius:14px; line-height:1.7; }
   .file-warning b{ font-weight:600; }
   .file-warning code{ font-size:10.5px; background:rgba(166,61,47,.1); padding:1px 5px; border-radius:4px; }
+  .diag{ font-size:11.5px; color:var(--sub); background:var(--paper); border:1px solid var(--line); padding:13px 15px; border-radius:12px; line-height:1.6; }
+  .diag[hidden]{ display:none; }
+  .diag b{ color:var(--ink); font-weight:600; }
+  .diag ul{ margin:9px 0 0; padding-left:16px; }
+  .diag li{ margin-bottom:4px; word-break:break-all; }
+  .diag-hint{ margin-top:11px; color:var(--clay); }
 
   .overlay-toolbar{ display:flex; gap:7px; flex-wrap:wrap; margin-bottom:16px; }
   .chip{ background:transparent; border:1px solid var(--line); color:var(--sub); font-size:12px; font-weight:500; padding:9px 15px; border-radius:999px; cursor:pointer; transition:.15s; font-family:inherit; }
@@ -178,6 +184,10 @@
   .query-overlay .rings-mark{ width:72px; height:72px; margin-bottom:20px; }
   .qo-inner{ display:flex; flex-direction:column; align-items:center; text-align:center; gap:6px; padding:16px; }
   .qo-title{ font-size:17px; font-weight:500; letter-spacing:-.02em; }
+  .qo-percent{ font-size:36px; font-weight:500; letter-spacing:-.045em; line-height:1.15; margin-top:6px; }
+  .qo-bar{ width:240px; max-width:60vw; height:3px; background:var(--fill); border-radius:999px; overflow:hidden; margin:8px 0 6px; }
+  .qo-bar span{ display:block; height:100%; width:0; background:var(--ink); border-radius:999px; transition:width .3s ease; }
+  .qo-phase{ font-size:12.5px; color:var(--ink); }
   .qo-meta{ font-size:12px; color:var(--sub); margin-bottom:10px; }
 
   /* ---- center definition ---- */
@@ -314,6 +324,8 @@
     </div>
     <button class="primary" id="btn-fetch" type="button" disabled>밀도 분석 실행</button>
     <div id="status" class="status" style="display:none;"></div>
+    <button class="secondary" id="btn-diag" type="button" style="width:100%;">서버 연결 진단</button>
+    <div class="diag" id="diag" hidden></div>
 
     <hr style="border:none; border-top:1px solid var(--line); margin:4px 0;">
 
@@ -352,6 +364,9 @@
           <div class="qo-inner">
             <div class="rings-mark" aria-hidden="true"><span class="r r1"></span><span class="r r2"></span><span class="r r3"></span><span class="dot"></span></div>
             <div class="qo-title">Overpass 조회 중</div>
+            <div class="qo-percent" id="qo-percent">0%</div>
+            <div class="qo-bar"><span id="qo-bar-fill"></span></div>
+            <div class="qo-phase" id="qo-phase">서버에 요청 보내는 중</div>
             <div class="qo-meta" id="qo-meta">0초 경과</div>
             <button class="secondary" id="qo-cancel" type="button">취소</button>
           </div>
@@ -450,6 +465,7 @@
           <div class="export-actions">
             <button class="primary" id="btn-zip" type="button">산출물 패키지(ZIP) 내려받기</button>
             <div class="row">
+              <button class="secondary" id="btn-pdf" type="button">PDF 보고서</button>
               <button class="secondary" data-export="comp" type="button">① CSV</button>
               <button class="secondary" data-export="ring" type="button">② CSV</button>
               <button class="secondary" data-export="park" type="button">③ CSV</button>
@@ -571,9 +587,12 @@
 (function(){
   'use strict';
 
+  // 메인 서버(overpass-api.de)는 과부하가 잦아 키 없이 쓸 수 있는 미러를 함께 둔다
   const OVERPASS_ENDPOINTS = [
     'https://overpass-api.de/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
     'https://lz4.overpass-api.de/api/interpreter'
   ];
   const SECTOR_LABELS = ['N','NE','E','SE','S','SW','W','NW'];
@@ -716,7 +735,7 @@
 
   $('radius-input').addEventListener('change', () => {
     viewRadius = readRadius();
-    if (center) drawCircle(true);
+    if (center) drawCircle('quick');
     if (provenance && viewRadius !== provenance.radius) setStatus('반경이 바뀌었습니다. 결과를 갱신하려면 다시 분석을 실행하세요.', null);
   });
   $('ring-interval').addEventListener('change', () => { if (buildings.length) computeAndRender(); });
@@ -727,8 +746,9 @@
     $('ring-interval').dispatchEvent(new Event('change'));
   }));
 
+  // 위도·경도는 두 칸을 따로 고치므로 긴 비행 대신 짧게 이동한다 (검색 결과 선택만 길게 날아간다)
   ['center-lat','center-lon'].forEach(id => $(id).addEventListener('change', () => {
-    setCenter(parseFloat($('center-lat').value), parseFloat($('center-lon').value), 'manual', true);
+    setCenter(parseFloat($('center-lat').value), parseFloat($('center-lon').value), 'manual', 'quick');
   }));
 
   $('btn-pick').addEventListener('click', () => {
@@ -762,7 +782,21 @@
     } else {
       centerMarker.setLatLng([center.lat, center.lon]);
     }
-    if (fit) map.fitBounds(circleLayer.getBounds(), { padding:[20,20] });
+    if (fit) frameCircle(fit);
+  }
+
+  // 검색·좌표 입력으로 중심이 바뀌면 순간이동 대신 부드럽게 날아가듯 이동한다
+  function frameCircle(mode){
+    const bounds = circleLayer.getBounds();
+    const padding = [24, 24];
+    const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    // 백그라운드 탭에서는 requestAnimationFrame 이 멈춰 애니메이션이 중간에 서버리므로 바로 이동시킨다
+    if (reduceMotion || document.hidden){
+      map.fitBounds(bounds, { padding });
+      return;
+    }
+    map.stop();
+    map.flyToBounds(bounds, { padding, duration: mode === 'quick' ? 0.7 : 1.4, easeLinearity: 0.22 });
   }
 
   // ---- Geometry helpers (equirectangular projection around center) ----
@@ -841,39 +875,104 @@
   // file:// · data: 로 열린 페이지는 Origin 이 'null' 이라 Overpass 가 요청을 거부한다.
   const IS_FILE_ORIGIN = location.protocol === 'file:' || location.origin === 'null' || !location.origin;
 
-  async function fetchOverpass(query, token, timeoutMs, onProgress){
-    let lastErr;
-    for (const ep of OVERPASS_ENDPOINTS){
+  // 응답을 스트리밍으로 읽어 수신 바이트를 보고한다 (Overpass 는 chunked 라 Content-Length 가 없을 때가 많다)
+  async function readBody(res, hooks){
+    if (!res.body || !res.body.getReader) return res.text();
+    const total = Number(res.headers.get('content-length')) || 0;
+    const reader = res.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true){
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (hooks && hooks.onBytes) hooks.onBytes(received, total);
+    }
+    const buf = new Uint8Array(received);
+    let pos = 0;
+    chunks.forEach(c => { buf.set(c, pos); pos += c.length; });
+    return new TextDecoder('utf-8').decode(buf);
+  }
+
+  async function fetchOverpass(query, token, timeoutMs, hooks){
+    const details = [];
+    for (let i = 0; i < OVERPASS_ENDPOINTS.length; i++){
       if (token.cancelled) break;
-      const controller = new AbortController();
-      token.controller = controller;
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        if (onProgress) onProgress(ep);
-        const res = await fetch(ep, { method:'POST', body: 'data=' + encodeURIComponent(query), signal: controller.signal });
-        const text = await res.text();
-        if (!res.ok){
-          // Overpass 는 과부하 시 504/429 와 함께 HTML 오류 페이지를 돌려준다
-          throw new Error(res.status === 429 ? '요청 한도 초과(429)' : (res.status === 504 ? '서버 혼잡(504)' : 'HTTP ' + res.status));
+      const ep = OVERPASS_ENDPOINTS[i];
+      const host = new URL(ep).hostname;
+      const cap = i === 0 ? timeoutMs : Math.min(timeoutMs, 45000); // 대기 서버는 오래 붙잡지 않는다
+      // POST 가 프록시·확장 프로그램에 막히는 경우가 있어 같은 서버로 GET 도 한 번 시도한다
+      for (const method of ['POST','GET']){
+        if (token.cancelled) break;
+        const controller = new AbortController();
+        token.controller = controller;
+        const timer = setTimeout(() => controller.abort(), cap);
+        try {
+          if (hooks && hooks.onAttempt) hooks.onAttempt(ep, method);
+          const res = method === 'POST'
+            ? await fetch(ep, { method:'POST', body: 'data=' + encodeURIComponent(query), signal: controller.signal })
+            : await fetch(ep + '?data=' + encodeURIComponent(query), { signal: controller.signal });
+          const text = await readBody(res, hooks);
+          if (!res.ok){
+            // Overpass 는 과부하 시 504/429 와 함께 HTML 오류 페이지를 돌려준다
+            throw new Error(res.status === 429 ? '요청 한도 초과(429)' : (res.status === 504 ? '서버 혼잡(504)' : 'HTTP ' + res.status));
+          }
+          let data;
+          try { data = JSON.parse(text); }
+          catch(_){ throw new Error('JSON 대신 오류 페이지 반환'); }
+          // 시간 초과 시 Overpass 는 일부 결과와 함께 remark 를 준다 — 불완전한 결과는 쓰지 않는다
+          if (data.remark && /error|timed out/i.test(data.remark)) throw new Error('응답 오류: ' + data.remark);
+          return { data, endpoint: ep, details };
+        } catch(e){
+          if (token.cancelled) throw new Error('사용자 취소');
+          let msg;
+          if (e.name === 'AbortError') msg = '응답 없음(' + Math.round(cap/1000) + '초 초과)';
+          else if (e.name === 'TypeError') msg = IS_FILE_ORIGIN ? 'file:// 차단' : '연결 실패 (차단·CORS·네트워크)';
+          else msg = e.message;
+          details.push(host + ' ' + method + ' → ' + msg);
+          if (e.name !== 'TypeError') break; // 서버가 응답은 했으니 같은 서버에 GET 을 다시 보낼 이유가 없다
+        } finally {
+          clearTimeout(timer);
         }
-        let data;
-        try { data = JSON.parse(text); }
-        catch(_){ throw new Error('서버가 JSON 대신 오류 페이지를 반환했습니다'); }
-        // 시간 초과 시 Overpass 는 일부 결과와 함께 remark 를 준다 — 불완전한 결과는 쓰지 않는다
-        if (data.remark && /error|timed out/i.test(data.remark)) throw new Error('Overpass 응답 오류: ' + data.remark);
-        return { data, endpoint: ep };
-      } catch(e){
-        if (token.cancelled) throw new Error('사용자 취소');
-        if (e.name === 'AbortError') lastErr = new Error('응답 지연(' + Math.round(timeoutMs/1000) + '초 초과)');
-        else if (e.name === 'TypeError') lastErr = new Error(IS_FILE_ORIGIN ? 'file:// 차단' : '네트워크 연결 실패');
-        else lastErr = e;
-      } finally {
-        clearTimeout(timer);
       }
     }
     if (token.cancelled) throw new Error('사용자 취소');
-    throw lastErr || new Error('Overpass 서버에 연결할 수 없습니다.');
+    const err = new Error('모든 Overpass 서버 실패');
+    err.details = details;
+    throw err;
   }
+
+  function showDiag(lines, title){
+    const el = $('diag');
+    el.hidden = false;
+    const allBlocked = lines.every(l => /연결 실패|file:\/\/ 차단/.test(l));
+    el.innerHTML = '<b>' + escapeHtml(title) + '</b><ul>' + lines.map(l => '<li>' + escapeHtml(l) + '</li>').join('') + '</ul>' +
+      (allBlocked
+        ? '<div class="diag-hint">모두 “연결 실패”입니다. 네트워크(학교·회사 와이파이)나 광고 차단 확장 프로그램이 Overpass 서버를 막고 있을 가능성이 큽니다. 휴대폰 핫스팟이나 시크릿 창에서 다시 시도해 보세요.</div>'
+        : '<div class="diag-hint">“서버 혼잡(504)”이나 “요청 한도 초과(429)”는 공용 서버가 바쁜 상태입니다. 반경을 줄이거나 몇 분 뒤 다시 시도하세요.</div>');
+  }
+
+  $('btn-diag').addEventListener('click', async () => {
+    const el = $('diag');
+    el.hidden = false;
+    el.innerHTML = '<b>연결 진단 중…</b>';
+    const q = '[out:json][timeout:10];node(1);out;';
+    const results = await Promise.all(OVERPASS_ENDPOINTS.map(async ep => {
+      const host = new URL(ep).hostname, t0 = performance.now();
+      try {
+        const c = new AbortController();
+        const timer = setTimeout(() => c.abort(), 12000);
+        const r = await fetch(ep + '?data=' + encodeURIComponent(q), { signal: c.signal });
+        clearTimeout(timer);
+        const ms = Math.round(performance.now() - t0);
+        return host + ' → ' + (r.ok ? '정상' : 'HTTP ' + r.status) + ' (' + ms + 'ms)';
+      } catch(e){
+        return host + ' → ' + (e.name === 'AbortError' ? '응답 없음(12초 초과)' : '연결 실패 (차단·CORS·네트워크)');
+      }
+    }));
+    showDiag(results, '서버별 연결 상태');
+  });
 
   $('btn-fetch').addEventListener('click', runAnalysis);
   ['target-far','target-bcr'].forEach(id => {
@@ -898,23 +997,65 @@
 
     const token = activeQuery = { cancelled:false, controller:null };
     const started = Date.now();
-    let host = '';
-    const tick = () => { $('qo-meta').textContent = Math.floor((Date.now()-started)/1000) + '초 경과 · ' + host + ' · 반경 ' + fmtDist(queryRadius); };
-    const ticker = setInterval(tick, 1000);
+    let host = '', received = 0, phase = 'wait';
+
+    // Overpass 는 진행률을 알려주지 않는다. 응답 대기는 반경으로 추정하고, 수신 단계부터는 실제 바이트로 계산한다.
+    const expectedMs = queryRadius <= 500 ? 15000 : queryRadius <= 1000 ? 30000 : queryRadius <= 2000 ? 70000 : 120000;
+    const expectedBytes = Math.max(4e5, Math.pow(queryRadius/1000, 2) * 4.5e6);
+    const setProgress = (pct, phaseText) => {
+      const v = Math.max(0, Math.min(100, pct));
+      $('qo-percent').textContent = Math.round(v) + '%';
+      $('qo-bar-fill').style.width = v + '%';
+      if (phaseText) $('qo-phase').textContent = phaseText;
+    };
+    const tick = () => {
+      const sec = Math.floor((Date.now()-started)/1000);
+      let meta = sec + '초 경과 · 반경 ' + fmtDist(queryRadius);
+      if (host) meta += ' · ' + host;
+      if (received) meta += ' · ' + (received/1048576).toFixed(1) + 'MB';
+      $('qo-meta').textContent = meta;
+      if (phase === 'wait'){
+        setProgress(55 * (1 - Math.exp(-1.6 * (Date.now()-started) / expectedMs)), '서버 응답 기다리는 중 (예상 진행률)');
+      }
+    };
+    const ticker = setInterval(tick, 500);
+    // 화면이 보일 때는 실제 페인트를 기다리고, 백그라운드 탭에서는 requestAnimationFrame 이 멈추므로 타이머로 빠져나간다
+    const paint = () => new Promise(r => {
+      let settled = false;
+      const done = () => { if (!settled){ settled = true; r(); } };
+      requestAnimationFrame(() => setTimeout(done, 0));
+      setTimeout(done, 150);
+    });
+
     $('btn-fetch').disabled = true;
     $('query-overlay').hidden = false;
+    setProgress(2, '서버에 요청 보내는 중');
     tick();
 
     try {
-      const { data, endpoint } = await fetchOverpass(query, token, qTimeout*1000 + 15000, ep => {
-        host = new URL(ep).hostname;
-        tick();
-        setStatus('Overpass API 조회 중… (' + host + ')', null);
+      const { data, endpoint } = await fetchOverpass(query, token, qTimeout*1000 + 15000, {
+        onAttempt: (ep, method) => {
+          host = new URL(ep).hostname;
+          phase = 'wait';
+          received = 0;
+          tick();
+          setStatus('Overpass API 조회 중… (' + host + (method === 'GET' ? ' · GET 재시도' : '') + ')', null);
+        },
+        onBytes: (bytes, totalBytes) => {
+          phase = 'download';
+          received = bytes;
+          const frac = totalBytes ? bytes/totalBytes : (1 - Math.exp(-bytes/expectedBytes));
+          setProgress(55 + 25*Math.min(1, frac), '데이터 받는 중' + (totalBytes ? '' : ' (예상 진행률)'));
+        }
       });
-      $('qo-meta').textContent = '응답 처리 중… (' + fmtNum((data.elements || []).length) + '개 요소)';
-      await new Promise(r => setTimeout(r, 30)); // let the overlay text paint before heavy parsing
+      $('diag').hidden = true;
+      phase = 'parse';
+      setProgress(84, '건물 데이터 정리 중 · ' + fmtNum((data.elements || []).length) + '개 요소');
+      await paint(); // let the overlay repaint before heavy parsing blocks the thread
       radius = queryRadius;
       processElements(data.elements || []);
+      setProgress(92, '지표 계산 중');
+      await paint();
       provenance = {
         queriedAt: new Date(),
         endpoint,
@@ -932,10 +1073,13 @@
       $('placeholder').style.display = 'none';
       mapNeedsRender = true;
       computeAndRender();
+      setProgress(100, '완료');
     } catch(e){
+      const det = e.details || [];
       if (e.message === '사용자 취소') setStatus('조회를 취소했습니다.', null);
-      else if (IS_FILE_ORIGIN && e.message === 'file:// 차단') setStatus('Overpass 서버가 파일로 직접 연 페이지의 요청을 거부했습니다. 같은 폴더의 「대시보드 실행.bat」으로 열어주세요.', 'err');
-      else setStatus('Overpass 조회 실패: ' + e.message + ' — 공용 서버가 혼잡할 수 있으니 반경을 줄이거나 잠시 후 다시 시도해주세요.', 'err');
+      else if (det.some(d => d.indexOf('file:// 차단') >= 0)) setStatus('Overpass 서버가 파일로 직접 연 페이지의 요청을 거부했습니다. 같은 폴더의 「대시보드 실행.bat」으로 열어주세요.', 'err');
+      else setStatus('Overpass 조회 실패 — 아래 진단 결과에서 서버별 원인을 확인하세요.', 'err');
+      if (det.length) showDiag(det, '조회 실패 원인 (서버별)');
     } finally {
       clearInterval(ticker);
       activeQuery = null;
@@ -1837,6 +1981,127 @@
       ['03_smartpark_priority.svg', buildMatrixSVG({ title:'스마트공원 요소 우선순위 매트릭스', legend:true, caption:$('park-source').textContent })]
     ];
   }
+
+  // ---- PDF 보고서 (브라우저 인쇄 → "PDF로 저장") ----
+  const REPORT_CSS = [
+    '@page{ size:A4; margin:14mm; }',
+    '*{ box-sizing:border-box; }',
+    'body{ font-family:"Pretendard","Malgun Gothic",sans-serif; color:#0a0a0a; font-size:11px; line-height:1.55; margin:0; }',
+    'h1{ font-size:21px; font-weight:600; letter-spacing:-.03em; margin:0 0 6px; }',
+    'h2{ font-size:13.5px; font-weight:600; letter-spacing:-.02em; margin:0 0 9px; padding-bottom:6px; border-bottom:1px solid #0a0a0a; }',
+    '.sub{ font-size:10.5px; color:#75726b; margin:0 0 20px; }',
+    'section{ margin-bottom:22px; page-break-inside:avoid; }',
+    'table{ width:100%; border-collapse:collapse; font-size:10px; }',
+    'th,td{ border-bottom:1px solid #e3e1dc; padding:5px 6px; text-align:left; vertical-align:top; }',
+    'thead th{ background:#f4f3f0; font-weight:600; }',
+    'table.kv th{ width:34%; background:#f4f3f0; font-weight:500; }',
+    '.num{ text-align:right; }',
+    '.b{ font-weight:600; }',
+    'svg{ max-width:100%; height:auto; display:block; margin:12px 0; }',
+    'ul{ margin:0; padding-left:15px; }',
+    'li{ margin-bottom:3px; }',
+    '.foot{ font-size:9.5px; color:#75726b; border-top:1px solid #e3e1dc; padding-top:9px; margin-top:6px; }',
+    '.pb{ page-break-before:always; }'
+  ].join('\n');
+
+  function buildReportHTML(){
+    const p = provenance, esc = escapeHtml, total = buildings.length;
+    let foot = 0, floor = 0, known = 0;
+    buildings.forEach(b => { foot += b.area; floor += b.floorArea; if (!b.estimated) known++; });
+    const unclas = (lastComp.find(c => c.label === '미분류') || { count:0 }).count;
+    const pct = (a, b) => b ? (a/b*100).toFixed(1) + '%' : '—';
+
+    const kv = rows => '<table class="kv">' + rows.map(([k,v]) => '<tr><th>'+esc(k)+'</th><td>'+esc(v)+'</td></tr>').join('') + '</table>';
+
+    const info = kv([
+      ['조회일시', dateTime(p.queriedAt)],
+      ['데이터 출처', 'OpenStreetMap contributors · Overpass API'],
+      ['엔드포인트', p.endpoint],
+      ['OSM 데이터 기준 시각', p.osmBase || '—'],
+      ['대상지', p.siteName],
+      ['중심 좌표 (WGS84)', p.center.lat.toFixed(6) + ', ' + p.center.lon.toFixed(6)],
+      ['중심 정의 방법', METHOD_LABELS[p.centerMethod]],
+      ['분석 반경 / 링 간격', fmtDist(p.radius) + ' / ' + fmtDist(ringInterval())],
+      ['수집 건물', fmtNum(total) + '동'],
+      ['라이선스', 'ODbL 1.0 — © OpenStreetMap contributors']
+    ]);
+
+    const summary = kv([
+      ['건물 수', fmtNum(total) + '동'],
+      ['건폐율 (BCR)', fmtNum(siteAreaM2 ? foot/siteAreaM2*100 : 0, 1) + '%'],
+      ['용적률 (FAR, 추정)', fmtNum(siteAreaM2 ? floor/siteAreaM2*100 : 0, 1) + '%'],
+      ['평균 층수 (면적가중)', fmtNum(foot ? floor/foot : 0, 1) + '층'],
+      ['총 건폐면적', fmtNum(foot, 0) + ' ㎡'],
+      ['총 연면적 (추정)', fmtNum(floor, 0) + ' ㎡'],
+      ['용도 태그 기재율', pct(total - unclas, total) + ' (미분류 ' + fmtNum(unclas) + '동)'],
+      ['층수 태그 기재율', pct(known, total) + ' · 미기재는 ' + $('default-levels').value + '층 가정']
+    ]);
+
+    const compTable = '<table><thead><tr><th>용도 분류</th><th class="num">건물 수(동)</th><th class="num">비율</th><th class="num">건폐면적(㎡)</th><th class="num">연면적(㎡)</th></tr></thead><tbody>' +
+      lastComp.map(c => '<tr><td>'+esc(c.label)+'</td><td class="num">'+fmtNum(c.count)+'</td><td class="num">'+fmtNum(c.pct,1)+'%</td><td class="num">'+fmtNum(c.footprint,0)+'</td><td class="num">'+fmtNum(c.floor,0)+'</td></tr>').join('') +
+      '</tbody></table>';
+
+    const ringTable = '<table><thead><tr><th>링</th><th>거리</th><th class="num">링 면적(km²)</th><th class="num">건물 수(동)</th><th class="num">건물 밀도(동/km²)</th><th class="num">건폐율(%)</th><th class="num">용적률(%)</th><th class="num">평균 층수</th><th class="num">층수 기재율(%)</th></tr></thead><tbody>' +
+      lastRings.map(r => '<tr><td>'+r.label+'</td><td>'+r.range+'</td><td class="num">'+fmtNum(r.areaKm2,2)+'</td><td class="num">'+fmtNum(r.count)+'</td><td class="num b">'+fmtNum(r.density,0)+'</td><td class="num b">'+fmtNum(r.bcr,1)+'</td><td class="num b">'+fmtNum(r.far,1)+'</td><td class="num">'+fmtNum(r.avgLevels,1)+'</td><td class="num">'+fmtNum(r.knownPct,0)+'</td></tr>').join('') +
+      '</tbody></table>';
+
+    const parkTable = '<table><thead><tr><th>순위</th><th>#</th><th>요소</th><th class="num">효과</th><th class="num">난이도</th><th class="num">점수</th><th>구분</th><th>근거</th></tr></thead><tbody>' +
+      rankedPark().map((r,k) => '<tr><td>'+(k+1)+'</td><td>'+(r.i+1)+'</td><td>'+esc(r.it.name)+'</td><td class="num">'+r.it.effect+'</td><td class="num">'+r.it.difficulty+'</td><td class="num">'+r.score+'</td><td>'+QUADRANTS[r.q].label+'</td><td>'+esc(r.it.reason || '')+'</td></tr>').join('') +
+      '</tbody></table>';
+
+    return '<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">' +
+      '<title>' + esc(p.siteName) + ' 반경 ' + fmtDist(p.radius) + ' 분석 보고서</title>' +
+      '<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">' +
+      '<style>' + REPORT_CSS + '</style></head><body>' +
+      '<h1>' + esc(p.siteName) + ' 반경 ' + fmtDist(p.radius) + ' — 건축밀도 분석 보고서</h1>' +
+      '<p class="sub">' + esc(sourceCaption()) + '</p>' +
+      '<section><h2>1. 조회 정보</h2>' + info + '</section>' +
+      '<section><h2>2. 권역 요약 지표</h2>' + summary + '</section>' +
+      '<section class="pb"><h2>3. 건물 용도 구성 (산출물 ①)</h2>' + compSVG() + compTable + '</section>' +
+      '<section class="pb"><h2>4. 링(권역)별 밀도표 (산출물 ②)</h2>' + ringTable + ringSVG() + '</section>' +
+      '<section class="pb"><h2>5. 스마트공원 요소 우선순위 (산출물 ③)</h2>' +
+        buildMatrixSVG({ title:'효과 × 난이도 매트릭스', legend:true }) + parkTable + '</section>' +
+      '<section><h2>6. 방법과 한계</h2><ul>' +
+        '<li>대상 건물: OSM <code>building=*</code> way 및 multipolygon relation (Overpass <code>around</code> 반경 필터)</li>' +
+        '<li>링 배정: 건물 폴리곤 중심점과 대상지 중심 사이의 거리 · 링 면적 = π × (R외² − R내²)</li>' +
+        '<li>건물 밀도 = 건물 수 ÷ 링 면적(km²), 건폐율 = 건축면적 합 ÷ 링 면적 × 100, 용적률 = 연면적 합 ÷ 링 면적 × 100</li>' +
+        '<li>연면적 = 바닥면적 × 층수이며, 층수 미기재 건물은 ' + $('default-levels').value + '층으로 가정했습니다</li>' +
+        '<li>스마트공원 우선순위는 팀 평가값(효과·난이도 1~5점, 4~5점 = 높음, 점수 = 효과 × (6 − 난이도))입니다</li>' +
+        '<li>OSM은 자원봉사 매핑 데이터라 지역별 태깅 편차가 있어 건축물대장 등 공식 자료와 교차검증이 필요합니다</li>' +
+      '</ul></section>' +
+      '<p class="foot">' + esc(sourceCaption()) + ' · 보고서 생성 ' + esc(dateTime(new Date())) + '</p>' +
+      '</body></html>';
+  }
+
+  function openPrintReport(){
+    const frame = document.createElement('iframe');
+    frame.setAttribute('aria-hidden', 'true');
+    frame.style.cssText = 'position:fixed; right:0; bottom:0; width:1px; height:1px; border:0; opacity:0;';
+    document.body.appendChild(frame);
+    const doc = frame.contentWindow.document;
+    doc.open();
+    doc.write(buildReportHTML());
+    doc.close();
+    const cleanup = () => { if (frame.parentNode) frame.remove(); };
+    frame.contentWindow.onafterprint = cleanup;
+    setTimeout(() => {   // give the webfont and SVG layout a moment before the print dialog opens
+      try {
+        frame.contentWindow.focus();
+        frame.contentWindow.print();
+      } catch(e){
+        cleanup();
+        setStatus('인쇄 창을 열지 못했습니다: ' + e.message, 'err');
+        return;
+      }
+      setTimeout(cleanup, 60000);
+    }, 600);
+  }
+
+  $('btn-pdf').addEventListener('click', () => {
+    if (!requireData()) return;
+    setStatus('인쇄 창에서 대상을 “PDF로 저장”으로 선택하세요.', null);
+    openPrintReport();
+  });
 
   function requireData(){
     if (provenance && buildings.length) return true;
